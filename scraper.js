@@ -5,12 +5,49 @@ const fs = require('fs');
 function today() {
   return new Date().toISOString().split('T')[0];
 }
-
 function safeFlat(arr, depth = 5) {
   try { return arr.flat(depth); } catch { return []; }
 }
 
-// ─── PARSER ───────────────────────────────────────────────────────────────────
+// ─── RESPONSE PARSER ──────────────────────────────────────────────────────────
+// Google Maps uses TWO different response formats:
+//
+//   FORMAT A — initial page load:
+//     )]}'\n[[...data...]]
+//     Strip the prefix, parse directly.
+//
+//   FORMAT B — scroll/pagination calls:
+//     {"c":0,"d":")]}'\n[[...data...]]"}/*""*/
+//     Parse outer JSON, extract .d, strip prefix, parse inner JSON.
+//
+function parseMapResponse(rawText) {
+  let text = rawText.trim();
+
+  // Format B: outer {"c":0,"d":"..."} wrapper with /*""*/ trailer
+  if (text.startsWith('{')) {
+    // Strip trailing /*""*/ or similar JS comment
+    text = text.replace(/\/\*""\*\/$/, '').trim();
+    try {
+      const outer = JSON.parse(text);
+      if (outer && typeof outer.d === 'string') {
+        // The .d field contains the real response — strip its XSS prefix
+        let inner = outer.d.trim();
+        if (inner.startsWith(`)]}'`))   inner = inner.slice(4);
+        if (inner.startsWith(')]}\\n')) inner = inner.slice(5);
+        if (inner.startsWith(')]}'))    inner = inner.slice(3);
+        return JSON.parse(inner);
+      }
+    } catch { /* fall through */ }
+  }
+
+  // Format A: direct XSS-prefixed JSON
+  if (text.startsWith(`)]}'`))   text = text.slice(4);
+  if (text.startsWith(')]}\\n')) text = text.slice(5);
+  if (text.startsWith(')]}'))    text = text.slice(3);
+  return JSON.parse(text);
+}
+
+// ─── BUSINESS EXTRACTOR ───────────────────────────────────────────────────────
 function extractBusinessesFromJSON(json, query) {
   const results = [];
 
@@ -45,11 +82,6 @@ function extractBusinessesFromJSON(json, query) {
 
         let category = 'N/A';
         if (Array.isArray(entry[13]) && typeof entry[13][0] === 'string') category = entry[13][0];
-
-        let lat = null, lng = null;
-        if (Array.isArray(entry[9]) && entry[9].length >= 4) {
-          lat = entry[9][2]; lng = entry[9][3];
-        }
 
         let phone = 'Not Found';
         for (const idx of [178, 183, 182, 16, 35]) {
@@ -95,27 +127,20 @@ function extractBusinessesFromJSON(json, query) {
           if (openingHours) break;
           if (!Array.isArray(entry[idx])) continue;
           const flat = safeFlat(entry[idx]);
-
           if (isOpenNow === null) {
             const openStr = flat.find(x => typeof x === 'string' &&
               (x.toLowerCase().includes('open') || x.toLowerCase().includes('closed')));
             if (openStr) isOpenNow = openStr.toLowerCase().includes('open');
           }
-
-          const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+          const days = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
           const hoursObj = {};
           let lastDay = null;
-
           flat.forEach(x => {
             if (typeof x !== 'string') return;
             const dayMatch = days.find(d => x.startsWith(d));
             if (dayMatch) { lastDay = dayMatch; return; }
-            if (lastDay && /\d{1,2}:\d{2}/.test(x)) {
-              hoursObj[lastDay] = x;
-              lastDay = null;
-            }
+            if (lastDay && /\d{1,2}:\d{2}/.test(x)) { hoursObj[lastDay] = x; lastDay = null; }
           });
-
           if (Object.keys(hoursObj).length > 0) openingHours = hoursObj;
         }
 
@@ -148,7 +173,6 @@ function extractBusinessesFromJSON(json, query) {
           if (typeof entry[idx] === 'string' && entry[idx].length > 20) description = entry[idx];
         }
 
-
         let mapsUrl = `https://www.google.com/maps/search/${encodeURIComponent(name)}`;
         if (placeId && placeId !== 'N/A') {
           mapsUrl = `https://www.google.com/maps/place/?q=place_id:${placeId}`;
@@ -160,7 +184,8 @@ function extractBusinessesFromJSON(json, query) {
           photoCount, description,
           hasMultipleBranches: false, branchCount: null, branchDetectSource: null,
           query, scrapedDate: today(),
-          status: 'new', messageSent: false, replied: false, dealClosed: false, isLead: website !== 'Not Found' ? false : true 
+          status: 'new', messageSent: false, replied: false, dealClosed: false,
+          isLead: website !== 'Not Found' ? false : true
         });
 
       } catch (e) {
@@ -181,20 +206,46 @@ function loadLeads() {
   }
   return [];
 }
-
 function saveLeads(leads) {
   fs.writeFileSync('leads.json', JSON.stringify(leads, null, 2), 'utf8');
   console.log(`💾 leads.json updated — ${leads.length} total leads`);
 }
 
-// ─── SINGLE QUERY SCRAPER (reuses existing page) ──────────────────────────────
+// ─── SCROLL HELPER ────────────────────────────────────────────────────────────
+async function scrollAndWaitForMoreItems(page, itemCountBefore, timeout = 9000) {
+  await page.evaluate(() => {
+    const panel = document.querySelector('div[role="feed"]');
+    if (!panel) return;
+    const children = panel.querySelectorAll(':scope > div');
+    if (children.length) {
+      children[children.length - 1].scrollIntoView({ behavior: 'instant', block: 'end' });
+    }
+  });
+
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    await page.waitForTimeout(500);
+    const currentCount = await page.evaluate(() => {
+      const panel = document.querySelector('div[role="feed"]');
+      return panel ? panel.querySelectorAll(':scope > div').length : 0;
+    });
+    if (currentCount > itemCountBefore) return currentCount;
+    const ended = await page.evaluate(() => {
+      const end = document.querySelector('p.fontBodyMedium > span');
+      return end && end.textContent.includes("You've reached the end");
+    });
+    if (ended) return null;
+  }
+  return null;
+}
+
+// ─── SINGLE QUERY SCRAPER ─────────────────────────────────────────────────────
 async function scrapeQuery(page, searchQuery, scrollCount, seenNames) {
   console.log(`\n🚀 Searching: "${searchQuery}"`);
 
   const newLeads = [];
   let activeResponses = 0;
 
-  // ── Attach fresh response listener for this query ──
   const onResponse = async (response) => {
     const url = response.url();
     const isTarget =
@@ -208,14 +259,10 @@ async function scrapeQuery(page, searchQuery, scrollCount, seenNames) {
 
     activeResponses++;
     try {
-      let text = await response.text();
-      if (text.startsWith(`)]}'`))   text = text.slice(4);
-      if (text.startsWith(')]}\\n')) text = text.slice(5);
-      if (text.startsWith(')]}'))    text = text.slice(3);
+      const rawText = await response.text();
+      const json = parseMapResponse(rawText); // ← handles both Format A and B
 
-      const json = JSON.parse(text);
       const found = extractBusinessesFromJSON(json, searchQuery);
-
       found.forEach(b => {
         if (!seenNames.has(b.name)) {
           seenNames.add(b.name);
@@ -223,13 +270,12 @@ async function scrapeQuery(page, searchQuery, scrollCount, seenNames) {
           console.log(`  ✅ [${newLeads.length}] ${b.name} | ⭐${b.rating} | 📞${b.phone}`);
         }
       });
-    } catch (e) { /* skip */ }
+    } catch (e) { /* skip unparseable responses */ }
     activeResponses--;
   };
 
   page.on('response', onResponse);
 
-  // ── Navigate to this query ──
   await page.goto(
     `https://www.google.com/maps/search/${encodeURIComponent(searchQuery)}`,
     { waitUntil: 'domcontentloaded', timeout: 60000 }
@@ -238,63 +284,49 @@ async function scrapeQuery(page, searchQuery, scrollCount, seenNames) {
   await page.waitForSelector('div[role="feed"]', { timeout: 15000 })
     .catch(() => console.log('⚠️ Feed not found, continuing...'));
 
-  await page.waitForTimeout(1000);
+  await page.waitForTimeout(2000);
 
   // ── Scroll loop ──
   for (let i = 0; i < scrollCount; i++) {
-    const scrolled = await page.evaluate(() => {
-      const panel = document.querySelector('div[role="feed"]');
-      if (!panel) return false;
-      panel.scrollTop += 800;
-      return true;
+    const itemsBefore = await page.evaluate(() => {
+      const p = document.querySelector('div[role="feed"]');
+      return p ? p.querySelectorAll(':scope > div').length : 0;
     });
 
-    if (!scrolled) {
-      console.log('\n⚠️ Scroll panel not found, stopping early.');
+    if (!itemsBefore) {
+      console.log('⚠️ Feed panel gone, stopping.');
       break;
     }
 
-    await page.waitForTimeout(1000);
+    const newCount = await scrollAndWaitForMoreItems(page, itemsBefore);
 
+    // Wait for in-flight API responses
     let waited = 0;
-    while (activeResponses > 0 && waited < 6000) {
+    while (activeResponses > 0 && waited < 5000) {
       await page.waitForTimeout(300);
       waited += 300;
     }
 
-    await page.waitForTimeout(500);
+    process.stdout.write(`\r📜 Scroll ${i + 1}/${scrollCount} — ${newLeads.length} leads found    \n`);
 
-    const endReached = await page.evaluate(() => {
-      const end = document.querySelector('p.fontBodyMedium > span');
-      return end && end.textContent.includes("You've reached the end");
-    });
-
-    process.stdout.write(`\r📜 Scroll ${i + 1}/${scrollCount} — ${newLeads.length} leads found`);
-
-    if (endReached) {
-      console.log(`\n🏁 Reached end of results at scroll ${i + 1}`);
+    if (newCount === null) {
+      console.log(`  ⚠️ No new items after scroll ${i + 1} — stopping early`);
       break;
     }
   }
 
-  // ── Final buffer ──
-  await page.waitForTimeout(1000);
-
-  // ── Detach listener so it doesn't fire on next query ──
+  await page.waitForTimeout(500);
   page.off('response', onResponse);
-
-  console.log('\n');
+  console.log('');
   return newLeads;
 }
 
-// ─── SCRAPE MULTIPLE (ONE BROWSER, ONE PAGE) ──────────────────────────────────
-async function scrapeMultiple(queries, scrollCount = 10) {
+// ─── SCRAPE MULTIPLE ──────────────────────────────────────────────────────────
+async function scrapeMultiple(queries, scrollCount = 5) {
   console.log(`\n🎯 Area-wise Gym Scraper — Surat`);
   console.log(`📋 Total queries: ${queries.length}`);
-  console.log(`📜 Scrolls per query: ${scrollCount}`);
-  console.log(`⏱️  Est. time: ~${Math.ceil(queries.length * 3)} minutes\n`);
+  console.log(`📜 Max scrolls per query: ${scrollCount}\n`);
 
-  // ── Launch browser ONCE ──
   const browser = await chromium.launch({ headless: false });
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
@@ -309,46 +341,38 @@ async function scrapeMultiple(queries, scrollCount = 10) {
 
   for (let i = 0; i < queries.length; i++) {
     console.log(`\n[${i + 1}/${queries.length}]`);
-
     const newLeads = await scrapeQuery(page, queries[i], scrollCount, seenNames);
 
     if (newLeads.length > 0) {
-      // Merge and save after every query so progress is never lost
       const allLeads = loadLeads();
-      const merged = [...allLeads, ...newLeads];
-      saveLeads(merged);
+      saveLeads([...allLeads, ...newLeads]);
       totalNew += newLeads.length;
-      console.log(`✅ +${newLeads.length} new leads this query (${totalNew} new total)\n`);
+      console.log(`✅ +${newLeads.length} new leads (${totalNew} total)\n`);
     } else {
-      console.log('⚠️  No new leads found for this query.\n');
+      console.log('⚠️  No new leads found.\n');
     }
 
-    // Small pause between queries (browser stays open)
     if (i < queries.length - 1) {
-      console.log('⏳ Waiting 1s before next area...');
+      console.log('⏳ Waiting 1s...');
       await new Promise(r => setTimeout(r, 1000));
     }
   }
 
-  // ── Close browser only after ALL queries are done ──
   await browser.close();
 
   const leads = loadLeads();
   console.log('\n═══════════════════════════════════════════');
-  console.log(`🎯 ALL DONE!`);
-  console.log(`🏋️  Total gyms in leads.json: ${leads.length}`);
-  console.log(`🆕 New leads this run: ${totalNew}`);
+  console.log(`🎯 ALL DONE! Total: ${leads.length} gyms | New this run: ${totalNew}`);
   console.log('═══════════════════════════════════════════\n');
   console.table(leads.slice(0, 5).map(b => ({
-    Name:    b.name,
-    Area:    b.query?.split('in ')[1]?.split(',')[0] || '',
-    Rating:  b.rating,
-    Phone:   b.phone
+    Name: b.name, Area: b.query?.split('in ')[1]?.split(',')[0] || '',
+    Rating: b.rating, Phone: b.phone
   })));
 }
 
 // ─── RUN ──────────────────────────────────────────────────────────────────────
 const queries = [
+  'gym in Surat, Gujarat, India',
   'gym in Adajan, Surat, Gujarat, India',
   'gym in Pal, Surat, Gujarat, India',
   'gym in Vesu, Surat, Gujarat, India',
@@ -385,4 +409,4 @@ const queries = [
   'gym in Bardoli, Surat, Gujarat, India'
 ];
 
-scrapeMultiple(queries, 5);
+scrapeMultiple(queries, 50);
