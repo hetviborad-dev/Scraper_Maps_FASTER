@@ -148,20 +148,6 @@ function extractBusinessesFromJSON(json, query) {
           if (typeof entry[idx] === 'string' && entry[idx].length > 20) description = entry[idx];
         }
 
-        let amenities = [];
-        for (const idx of [100, 171, 173]) {
-          if (amenities.length > 0) break;
-          if (Array.isArray(entry[idx])) {
-            const flat = safeFlat(entry[idx]);
-            const found = flat.filter(x =>
-              typeof x === 'string' && x.length > 5 &&
-              (x.includes('wheelchair') || x.includes('parking') ||
-               x.includes('wifi') || x.includes('outdoor') ||
-               x.includes('delivery') || x.includes('dine'))
-            );
-            if (found.length > 0) amenities = found;
-          }
-        }
 
         let mapsUrl = `https://www.google.com/maps/search/${encodeURIComponent(name)}`;
         if (placeId && placeId !== 'N/A') {
@@ -171,10 +157,10 @@ function extractBusinessesFromJSON(json, query) {
         results.push({
           placeId, name, category, phone, address, website, social, mapsUrl,
           rating, reviewCount, isOpenNow, openingHours, priceRange, plusCode,
-          photoCount, description, amenities,
+          photoCount, description,
           hasMultipleBranches: false, branchCount: null, branchDetectSource: null,
           query, scrapedDate: today(),
-          status: 'new', messageSent: false, replied: false, dealClosed: false, isLead: true
+          status: 'new', messageSent: false, replied: false, dealClosed: false, isLead: website !== 'Not Found' ? false : true 
         });
 
       } catch (e) {
@@ -201,26 +187,15 @@ function saveLeads(leads) {
   console.log(`💾 leads.json updated — ${leads.length} total leads`);
 }
 
-// ─── MAIN SCRAPER ─────────────────────────────────────────────────────────────
-async function scrapeGoogleMaps(searchQuery, scrollCount = 10) {
-  console.log(`\n🚀 Starting: "${searchQuery}"`);
+// ─── SINGLE QUERY SCRAPER (reuses existing page) ──────────────────────────────
+async function scrapeQuery(page, searchQuery, scrollCount, seenNames) {
+  console.log(`\n🚀 Searching: "${searchQuery}"`);
 
-  const browser = await chromium.launch({ headless: false });
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-    locale: 'en-IN',
-    timezoneId: 'Asia/Kolkata'
-  });
-  const page = await context.newPage();
-
-  const existingLeads = loadLeads();
-  const seenNames = new Set(existingLeads.map(l => l.name));
   const newLeads = [];
-
-  // ✅ KEY FIX: Track active response processing count
   let activeResponses = 0;
 
-  page.on('response', async (response) => {
+  // ── Attach fresh response listener for this query ──
+  const onResponse = async (response) => {
     const url = response.url();
     const isTarget =
       url.includes('search?tbm=map') ||
@@ -232,7 +207,6 @@ async function scrapeGoogleMaps(searchQuery, scrollCount = 10) {
     if (!isTarget) return;
 
     activeResponses++;
-
     try {
       let text = await response.text();
       if (text.startsWith(`)]}'`))   text = text.slice(4);
@@ -249,12 +223,13 @@ async function scrapeGoogleMaps(searchQuery, scrollCount = 10) {
           console.log(`  ✅ [${newLeads.length}] ${b.name} | ⭐${b.rating} | 📞${b.phone}`);
         }
       });
-
     } catch (e) { /* skip */ }
-
     activeResponses--;
-  });
+  };
 
+  page.on('response', onResponse);
+
+  // ── Navigate to this query ──
   await page.goto(
     `https://www.google.com/maps/search/${encodeURIComponent(searchQuery)}`,
     { waitUntil: 'domcontentloaded', timeout: 60000 }
@@ -263,13 +238,10 @@ async function scrapeGoogleMaps(searchQuery, scrollCount = 10) {
   await page.waitForSelector('div[role="feed"]', { timeout: 15000 })
     .catch(() => console.log('⚠️ Feed not found, continuing...'));
 
-  // Wait for initial results to load fully
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(1000);
 
-  // ✅ KEY FIX: Scroll one step at a time, wait for API response after each scroll
+  // ── Scroll loop ──
   for (let i = 0; i < scrollCount; i++) {
-
-    // Scroll the panel
     const scrolled = await page.evaluate(() => {
       const panel = document.querySelector('div[role="feed"]');
       if (!panel) return false;
@@ -282,20 +254,16 @@ async function scrapeGoogleMaps(searchQuery, scrollCount = 10) {
       break;
     }
 
-    // ✅ Wait for Google to fire the new API request (triggered by scroll)
     await page.waitForTimeout(1000);
 
-    // ✅ Wait for all active responses to finish processing (max 6 seconds)
     let waited = 0;
     while (activeResponses > 0 && waited < 6000) {
       await page.waitForTimeout(300);
       waited += 300;
     }
 
-    // ✅ Small buffer after processing
     await page.waitForTimeout(500);
 
-    // ✅ Check if we hit the end of the list
     const endReached = await page.evaluate(() => {
       const end = document.querySelector('p.fontBodyMedium > span');
       return end && end.textContent.includes("You've reached the end");
@@ -309,43 +277,67 @@ async function scrapeGoogleMaps(searchQuery, scrollCount = 10) {
     }
   }
 
-  // ✅ Final buffer to catch any last late responses
-  await page.waitForTimeout(3000);
+  // ── Final buffer ──
+  await page.waitForTimeout(1000);
+
+  // ── Detach listener so it doesn't fire on next query ──
+  page.off('response', onResponse);
 
   console.log('\n');
-  await browser.close();
-
-  if (newLeads.length === 0) {
-    console.log('⚠️  No new leads found for this query.\n');
-    return;
-  }
-
-  const allLeads = [...existingLeads, ...newLeads];
-  saveLeads(allLeads);
-  console.log(`✅ Added ${newLeads.length} new leads (${allLeads.length} total in leads.json)\n`);
+  return newLeads;
 }
 
-// ─── SCRAPE MULTIPLE ──────────────────────────────────────────────────────────
+// ─── SCRAPE MULTIPLE (ONE BROWSER, ONE PAGE) ──────────────────────────────────
 async function scrapeMultiple(queries, scrollCount = 10) {
   console.log(`\n🎯 Area-wise Gym Scraper — Surat`);
   console.log(`📋 Total queries: ${queries.length}`);
   console.log(`📜 Scrolls per query: ${scrollCount}`);
   console.log(`⏱️  Est. time: ~${Math.ceil(queries.length * 3)} minutes\n`);
 
+  // ── Launch browser ONCE ──
+  const browser = await chromium.launch({ headless: false });
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+    locale: 'en-IN',
+    timezoneId: 'Asia/Kolkata'
+  });
+  const page = await context.newPage();
+
+  const existingLeads = loadLeads();
+  const seenNames = new Set(existingLeads.map(l => l.name));
+  let totalNew = 0;
+
   for (let i = 0; i < queries.length; i++) {
     console.log(`\n[${i + 1}/${queries.length}]`);
-    await scrapeGoogleMaps(queries[i], scrollCount);
 
+    const newLeads = await scrapeQuery(page, queries[i], scrollCount, seenNames);
+
+    if (newLeads.length > 0) {
+      // Merge and save after every query so progress is never lost
+      const allLeads = loadLeads();
+      const merged = [...allLeads, ...newLeads];
+      saveLeads(merged);
+      totalNew += newLeads.length;
+      console.log(`✅ +${newLeads.length} new leads this query (${totalNew} new total)\n`);
+    } else {
+      console.log('⚠️  No new leads found for this query.\n');
+    }
+
+    // Small pause between queries (browser stays open)
     if (i < queries.length - 1) {
-      console.log('⏳ Waiting 5s before next area...');
-      await new Promise(r => setTimeout(r, 5000));
+      console.log('⏳ Waiting 1s before next area...');
+      await new Promise(r => setTimeout(r, 1000));
     }
   }
+
+  // ── Close browser only after ALL queries are done ──
+  await browser.close();
 
   const leads = loadLeads();
   console.log('\n═══════════════════════════════════════════');
   console.log(`🎯 ALL DONE!`);
   console.log(`🏋️  Total gyms in leads.json: ${leads.length}`);
+  console.log(`🆕 New leads this run: ${totalNew}`);
   console.log('═══════════════════════════════════════════\n');
   console.table(leads.slice(0, 5).map(b => ({
     Name:    b.name,
@@ -358,39 +350,39 @@ async function scrapeMultiple(queries, scrollCount = 10) {
 // ─── RUN ──────────────────────────────────────────────────────────────────────
 const queries = [
   'gym in Adajan, Surat, Gujarat, India',
-//   'gym in Pal, Surat, Gujarat, India',
-//   'gym in Vesu, Surat, Gujarat, India',
-//   'gym in Piplod, Surat, Gujarat, India',
-//   'gym in Althan, Surat, Gujarat, India',
-//   'gym in Athwa, Surat, Gujarat, India',
-//   'gym in Rander, Surat, Gujarat, India',
-//   'gym in Varachha, Surat, Gujarat, India',
-//   'gym in Katargam, Surat, Gujarat, India',
-//   'gym in Udhna, Surat, Gujarat, India',
-//   'gym in Limbayat, Surat, Gujarat, India',
-//   'gym in Bhatar, Surat, Gujarat, India',
-//   'gym in Dindoli, Surat, Gujarat, India',
-//   'gym in Pandesara, Surat, Gujarat, India',
-//   'gym in Sachin, Surat, Gujarat, India',
-//   'gym in Sarthana, Surat, Gujarat, India',
-//   'gym in Kamrej, Surat, Gujarat, India',
-//   'gym in Punagam, Surat, Gujarat, India',
-//   'gym in VIP Road, Surat, Gujarat, India',
-//   'gym in Citylight, Surat, Gujarat, India',
-//   'gym in Ghod Dod Road, Surat, Gujarat, India',
-//   'gym in Ring Road, Surat, Gujarat, India',
-//   'gym in Amroli, Surat, Gujarat, India',
-//   'gym in Puna, Surat, Gujarat, India',
-//   'gym in Khatodara, Surat, Gujarat, India',
-//   'gym in Singanpor, Surat, Gujarat, India',
-//   'gym in Dumas, Surat, Gujarat, India',
-//   'gym in Magdalla, Surat, Gujarat, India',
-//   'gym in Hazira, Surat, Gujarat, India',
-//   'gym in Ichchhapor, Surat, Gujarat, India',
-//   'gym in Kosad, Surat, Gujarat, India',
-//   'gym in Tarsali, Surat, Gujarat, India',
-//   'gym in Rundh, Surat, Gujarat, India',
-//   'gym in Bardoli, Surat, Gujarat, India'
+  'gym in Pal, Surat, Gujarat, India',
+  'gym in Vesu, Surat, Gujarat, India',
+  'gym in Piplod, Surat, Gujarat, India',
+  'gym in Althan, Surat, Gujarat, India',
+  'gym in Athwa, Surat, Gujarat, India',
+  'gym in Rander, Surat, Gujarat, India',
+  'gym in Varachha, Surat, Gujarat, India',
+  'gym in Katargam, Surat, Gujarat, India',
+  'gym in Udhna, Surat, Gujarat, India',
+  'gym in Limbayat, Surat, Gujarat, India',
+  'gym in Bhatar, Surat, Gujarat, India',
+  'gym in Dindoli, Surat, Gujarat, India',
+  'gym in Pandesara, Surat, Gujarat, India',
+  'gym in Sachin, Surat, Gujarat, India',
+  'gym in Sarthana, Surat, Gujarat, India',
+  'gym in Kamrej, Surat, Gujarat, India',
+  'gym in Punagam, Surat, Gujarat, India',
+  'gym in VIP Road, Surat, Gujarat, India',
+  'gym in Citylight, Surat, Gujarat, India',
+  'gym in Ghod Dod Road, Surat, Gujarat, India',
+  'gym in Ring Road, Surat, Gujarat, India',
+  'gym in Amroli, Surat, Gujarat, India',
+  'gym in Puna, Surat, Gujarat, India',
+  'gym in Khatodara, Surat, Gujarat, India',
+  'gym in Singanpor, Surat, Gujarat, India',
+  'gym in Dumas, Surat, Gujarat, India',
+  'gym in Magdalla, Surat, Gujarat, India',
+  'gym in Hazira, Surat, Gujarat, India',
+  'gym in Ichchhapor, Surat, Gujarat, India',
+  'gym in Kosad, Surat, Gujarat, India',
+  'gym in Tarsali, Surat, Gujarat, India',
+  'gym in Rundh, Surat, Gujarat, India',
+  'gym in Bardoli, Surat, Gujarat, India'
 ];
 
-scrapeMultiple(queries, 20);
+scrapeMultiple(queries, 5);
