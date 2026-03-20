@@ -353,8 +353,8 @@ async function scrapeMultiple(queries, scrollCount = 5) {
     }
 
     if (i < queries.length - 1) {
-      console.log('⏳ Waiting 1s...');
-      await new Promise(r => setTimeout(r, 1000));
+      console.log('⏳ Waiting 5s...');
+      await new Promise(r => setTimeout(r, 5000));
     }
   }
 
@@ -404,9 +404,8 @@ const queries = [
   'gym in Hazira, Surat, Gujarat, India',
   'gym in Ichchhapor, Surat, Gujarat, India',
   'gym in Kosad, Surat, Gujarat, India',
-  'gym in Tarsali, Surat, Gujarat, India',
   'gym in Rundh, Surat, Gujarat, India',
   'gym in Bardoli, Surat, Gujarat, India'
 ];
 
-scrapeMultiple(queries, 50);
+scrapeMultiple(queries, 30);
