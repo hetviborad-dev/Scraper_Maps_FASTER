@@ -1,6 +1,54 @@
 const { chromium } = require('playwright');
 const fs = require('fs');
 
+// ─── STRICT CATEGORY FILTER ───────────────────────────────────────────────────
+
+// ✅ ALLOW only entries whose category OR name matches these keywords
+const ALLOWED_CATEGORY_KEYWORDS = [
+  'gym', 'fitness center', 'fitness club', 'fitness studio',
+  'health club', 'weight training', 'crossfit', 'boxing gym', 'strength training',
+  'personal training', 'powerlifting', 'bodybuilding', 'hiit', 'orangetheory',
+  'anytime fitness', 'planet fitness', 'la fitness', 'equinox',
+  'lifetime fitness', 'crunch fitness', 'f45', 'barry\'s',
+];
+
+// ❌ BLOCK entries whose category OR name contains these keywords
+const BLOCKED_KEYWORDS = [
+  'park', 'school', 'academy', 'university', 'college',
+  'pilates', 'yoga', 'dance', 'ballet', 'gymnastics',
+  'swimming', 'swim', 'pool', 'aquatic',
+  'spa', 'salon', 'massage', 'therapy', 'chiropractic',
+  'physical therapy', 'rehabilitation', 'rehab',
+  'daycare', 'childcare', 'preschool', 'kindergarten',
+  'church', 'temple', 'mosque', 'community center',
+  'playground', 'stadium', 'arena', 'golf',
+  'tennis', 'basketball court', 'baseball',
+  'karate school', 'taekwondo school', 'judo school',
+  'nutrition', 'supplement', 'pharmacy',
+  'hospital', 'clinic', 'medical',
+];
+
+function isValidGym(name, category) {
+  const nameLower  = (name     || '').toLowerCase();
+  const catLower   = (category || '').toLowerCase();
+  const combined   = `${nameLower} ${catLower}`;
+
+  // 1️⃣ Hard block — if name/category contains a blocked keyword → reject
+  for (const blocked of BLOCKED_KEYWORDS) {
+    if (combined.includes(blocked)) {
+      // Exception: "boxing gym", "mma gym" etc. are fine even if "school" appears
+      const isGymException = ALLOWED_CATEGORY_KEYWORDS.some(k => combined.includes(k));
+      if (!isGymException) {
+        return false;
+      }
+    }
+  }
+
+  // 2️⃣ Must match at least one allowed keyword
+  const isAllowed = ALLOWED_CATEGORY_KEYWORDS.some(k => combined.includes(k));
+  return isAllowed;
+}
+
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 function today() {
   return new Date().toISOString().split('T')[0];
@@ -8,29 +56,49 @@ function today() {
 function safeFlat(arr, depth = 5) {
   try { return arr.flat(depth); } catch { return []; }
 }
+// ─── CLOSURE STATUS DETECTOR ──────────────────────────────────────────────────
+function getClosureStatus(entry) {
+  // Indices most likely to carry business_status / closure labels in Maps JSON
+  const checkIndices = [88, 34, 4, 203, 97, 100, 111, 32, 99];
+
+  for (const idx of checkIndices) {
+    if (entry[idx] == null) continue;
+
+    // Handle both array and plain string at the index
+    const items = Array.isArray(entry[idx])
+      ? safeFlat(entry[idx])
+      : [entry[idx]];
+
+    for (const item of items) {
+      if (typeof item !== 'string') continue;
+      const lower = item.toLowerCase();
+      if (lower.includes('permanently closed'))  return 'permanently_closed';
+      if (lower.includes('temporarily closed'))  return 'temporarily_closed';
+    }
+  }
+
+  // Fallback: scan the entire entry shallowly for closure strings
+  for (let i = 0; i < entry.length; i++) {
+    if (typeof entry[i] === 'string') {
+      const lower = entry[i].toLowerCase();
+      if (lower.includes('permanently closed'))  return 'permanently_closed';
+      if (lower.includes('temporarily closed'))  return 'temporarily_closed';
+    }
+  }
+
+  return null; // Business is operational (or status unknown → keep it)
+}
+
 
 // ─── RESPONSE PARSER ──────────────────────────────────────────────────────────
-// Google Maps uses TWO different response formats:
-//
-//   FORMAT A — initial page load:
-//     )]}'\n[[...data...]]
-//     Strip the prefix, parse directly.
-//
-//   FORMAT B — scroll/pagination calls:
-//     {"c":0,"d":")]}'\n[[...data...]]"}/*""*/
-//     Parse outer JSON, extract .d, strip prefix, parse inner JSON.
-//
 function parseMapResponse(rawText) {
   let text = rawText.trim();
 
-  // Format B: outer {"c":0,"d":"..."} wrapper with /*""*/ trailer
   if (text.startsWith('{')) {
-    // Strip trailing /*""*/ or similar JS comment
     text = text.replace(/\/\*""\*\/$/, '').trim();
     try {
       const outer = JSON.parse(text);
       if (outer && typeof outer.d === 'string') {
-        // The .d field contains the real response — strip its XSS prefix
         let inner = outer.d.trim();
         if (inner.startsWith(`)]}'`))   inner = inner.slice(4);
         if (inner.startsWith(')]}\\n')) inner = inner.slice(5);
@@ -40,7 +108,6 @@ function parseMapResponse(rawText) {
     } catch { /* fall through */ }
   }
 
-  // Format A: direct XSS-prefixed JSON
   if (text.startsWith(`)]}'`))   text = text.slice(4);
   if (text.startsWith(')]}\\n')) text = text.slice(5);
   if (text.startsWith(')]}'))    text = text.slice(3);
@@ -62,6 +129,29 @@ function extractBusinessesFromJSON(json, query) {
         if (!name) { deepSearch(entry, depth + 1); return; }
         if (name.startsWith('gcid:') || name.length < 3) { deepSearch(entry, depth + 1); return; }
 
+        let category = 'N/A';
+        if (Array.isArray(entry[13]) && typeof entry[13][0] === 'string') category = entry[13][0];
+
+        // ─── STRICT FILTER: skip anything that isn't a real gym ───────────────
+        if (!isValidGym(name, category)) {
+          console.log(`  ⛔ Skipped (not a gym): "${name}" [${category}]`);
+          return;
+        }
+
+        // ─── STRICT FILTER: skip anything that isn't a real gym ───────────────
+        if (!isValidGym(name, category)) {
+          console.log(`  ⛔ Skipped (not a gym): "${name}" [${category}]`);
+          return;
+        }
+
+        // ─── NEW: skip permanently / temporarily closed businesses ────────────
+        const closureStatus = getClosureStatus(entry);
+        if (closureStatus) {
+          console.log(`  🚫 Skipped (${closureStatus.replace(/_/g, ' ')}): "${name}"`);
+          return;
+        }
+
+
         let placeId = 'N/A';
         if (typeof entry[78] === 'string') placeId = entry[78];
         else if (typeof entry[10] === 'string' && entry[10].includes('0x')) placeId = entry[10];
@@ -79,9 +169,6 @@ function extractBusinessesFromJSON(json, query) {
         } else if (Array.isArray(entry[2])) {
           address = entry[2].filter(x => typeof x === 'string').join(', ');
         }
-
-        let category = 'N/A';
-        if (Array.isArray(entry[13]) && typeof entry[13][0] === 'string') category = entry[13][0];
 
         let phone = 'Not Found';
         for (const idx of [178, 183, 182, 16, 35]) {
@@ -185,7 +272,8 @@ function extractBusinessesFromJSON(json, query) {
           hasMultipleBranches: false, branchCount: null, branchDetectSource: null,
           query, scrapedDate: today(),
           status: 'new', messageSent: false, replied: false, dealClosed: false,
-          isLead: website !== 'Not Found' ? false : true
+          isLead: website !== 'Not Found' ? false : true,
+          closureStatus: null,
         });
 
       } catch (e) {
@@ -243,8 +331,45 @@ async function scrollAndWaitForMoreItems(page, itemCountBefore, timeout = 9000) 
 async function scrapeQuery(page, searchQuery, scrollCount, seenNames) {
   console.log(`\n🚀 Searching: "${searchQuery}"`);
 
-  const newLeads = [];
-  let activeResponses = 0;
+  const newLeads       = [];
+  let   activeResponses = 0;
+  const closedNamesDOM = new Set(); // ← tracks DOM-detected closed businesses
+
+  // ─── DOM SCANNER: reads the visible feed for closed labels ────────────────
+  async function scanDOMForClosedBusinesses() {
+    const names = await page.evaluate(() => {
+      const closed = [];
+      document.querySelectorAll('div[role="feed"] > div').forEach(item => {
+        const txt = item.textContent || '';
+        const isClosed =
+          txt.includes('Temporarily closed') ||
+          txt.includes('Permanently closed');
+        if (!isClosed) return;
+
+        // Try every reasonable selector to extract the business name
+        const candidates = [
+          item.querySelector('a[aria-label]')?.getAttribute('aria-label'),
+          item.querySelector('[aria-label]')?.getAttribute('aria-label'),
+          item.querySelector('h3')?.textContent,
+          item.querySelector('[role="heading"]')?.textContent,
+        ];
+        for (const c of candidates) {
+          if (!c) continue;
+          const name = c.split('\n')[0].trim();
+          if (name.length > 2) { closed.push(name); break; }
+        }
+      });
+      return closed;
+    }).catch(() => []);
+
+    names.forEach(n => {
+      if (!closedNamesDOM.has(n)) {
+        console.log(`  🚫 DOM-closed detected: "${n}"`);
+        closedNamesDOM.add(n);
+      }
+    });
+  }
+  // ──────────────────────────────────────────────────────────────────────────
 
   const onResponse = async (response) => {
     const url = response.url();
@@ -260,17 +385,22 @@ async function scrapeQuery(page, searchQuery, scrollCount, seenNames) {
     activeResponses++;
     try {
       const rawText = await response.text();
-      const json = parseMapResponse(rawText); // ← handles both Format A and B
+      const json    = parseMapResponse(rawText);
+      const found   = extractBusinessesFromJSON(json, searchQuery);
 
-      const found = extractBusinessesFromJSON(json, searchQuery);
       found.forEach(b => {
+        // ← check DOM-closed set first
+        if (closedNamesDOM.has(b.name)) {
+          console.log(`  🚫 Skipped (DOM-closed): "${b.name}"`);
+          return;
+        }
         if (!seenNames.has(b.name)) {
           seenNames.add(b.name);
           newLeads.push(b);
-          console.log(`  ✅ [${newLeads.length}] ${b.name} | ⭐${b.rating} | 📞${b.phone}`);
+          console.log(`  ✅ [${newLeads.length}] ${b.name} | [${b.category}] | ⭐${b.rating} | 📞${b.phone}`);
         }
       });
-    } catch (e) { /* skip unparseable responses */ }
+    } catch (e) { /* skip unparseable */ }
     activeResponses--;
   };
 
@@ -285,8 +415,8 @@ async function scrapeQuery(page, searchQuery, scrollCount, seenNames) {
     .catch(() => console.log('⚠️ Feed not found, continuing...'));
 
   await page.waitForTimeout(2000);
+  await scanDOMForClosedBusinesses(); // ← initial scan before scrolling
 
-  // ── Scroll loop ──
   for (let i = 0; i < scrollCount; i++) {
     const itemsBefore = await page.evaluate(() => {
       const p = document.querySelector('div[role="feed"]');
@@ -300,12 +430,13 @@ async function scrapeQuery(page, searchQuery, scrollCount, seenNames) {
 
     const newCount = await scrollAndWaitForMoreItems(page, itemsBefore);
 
-    // Wait for in-flight API responses
     let waited = 0;
     while (activeResponses > 0 && waited < 5000) {
       await page.waitForTimeout(300);
       waited += 300;
     }
+
+    await scanDOMForClosedBusinesses(); // ← scan after EVERY scroll
 
     process.stdout.write(`\r📜 Scroll ${i + 1}/${scrollCount} — ${newLeads.length} leads found    \n`);
 
@@ -317,15 +448,27 @@ async function scrapeQuery(page, searchQuery, scrollCount, seenNames) {
 
   await page.waitForTimeout(500);
   page.off('response', onResponse);
+
+  // ─── FINAL SAFETY PASS: purge any closed leads that slipped in before DOM scan
+  const finalLeads = newLeads.filter(b => {
+    if (closedNamesDOM.has(b.name)) {
+      console.log(`  🧹 Post-filter removed (closed): "${b.name}"`);
+      return false;
+    }
+    return true;
+  });
+
   console.log('');
-  return newLeads;
+  return finalLeads;
 }
+
 
 // ─── SCRAPE MULTIPLE ──────────────────────────────────────────────────────────
 async function scrapeMultiple(queries, scrollCount = 5) {
   console.log(`\n🎯 Area-wise Gym Scraper — Surat`);
   console.log(`📋 Total queries: ${queries.length}`);
-  console.log(`📜 Max scrolls per query: ${scrollCount}\n`);
+  console.log(`📜 Max scrolls per query: ${scrollCount}`);
+  console.log(`🔒 Strict category filter: ON\n`);
 
   const browser = await chromium.launch({ headless: false });
   const context = await browser.newContext({
@@ -365,47 +508,36 @@ async function scrapeMultiple(queries, scrollCount = 5) {
   console.log(`🎯 ALL DONE! Total: ${leads.length} gyms | New this run: ${totalNew}`);
   console.log('═══════════════════════════════════════════\n');
   console.table(leads.slice(0, 5).map(b => ({
-    Name: b.name, Area: b.query?.split('in ')[1]?.split(',')[0] || '',
+    Name: b.name, Category: b.category,
+    Area: b.query?.split('in ')[1]?.split(',')[0] || '',
     Rating: b.rating, Phone: b.phone
   })));
 }
 
 // ─── RUN ──────────────────────────────────────────────────────────────────────
 const queries = [
-  'gym in Surat, Gujarat, India',
-  'gym in Adajan, Surat, Gujarat, India',
-  'gym in Pal, Surat, Gujarat, India',
-  'gym in Vesu, Surat, Gujarat, India',
-  'gym in Piplod, Surat, Gujarat, India',
-  'gym in Althan, Surat, Gujarat, India',
-  'gym in Athwa, Surat, Gujarat, India',
-  'gym in Rander, Surat, Gujarat, India',
-  'gym in Varachha, Surat, Gujarat, India',
-  'gym in Katargam, Surat, Gujarat, India',
-  'gym in Udhna, Surat, Gujarat, India',
-  'gym in Limbayat, Surat, Gujarat, India',
-  'gym in Bhatar, Surat, Gujarat, India',
-  'gym in Dindoli, Surat, Gujarat, India',
-  'gym in Pandesara, Surat, Gujarat, India',
-  'gym in Sachin, Surat, Gujarat, India',
-  'gym in Sarthana, Surat, Gujarat, India',
-  'gym in Kamrej, Surat, Gujarat, India',
-  'gym in Punagam, Surat, Gujarat, India',
-  'gym in VIP Road, Surat, Gujarat, India',
-  'gym in Citylight, Surat, Gujarat, India',
-  'gym in Ghod Dod Road, Surat, Gujarat, India',
-  'gym in Ring Road, Surat, Gujarat, India',
-  'gym in Amroli, Surat, Gujarat, India',
-  'gym in Puna, Surat, Gujarat, India',
-  'gym in Khatodara, Surat, Gujarat, India',
-  'gym in Singanpor, Surat, Gujarat, India',
-  'gym in Dumas, Surat, Gujarat, India',
-  'gym in Magdalla, Surat, Gujarat, India',
-  'gym in Hazira, Surat, Gujarat, India',
-  'gym in Ichchhapor, Surat, Gujarat, India',
-  'gym in Kosad, Surat, Gujarat, India',
-  'gym in Rundh, Surat, Gujarat, India',
-  'gym in Bardoli, Surat, Gujarat, India'
+  'gym in Highland Park, Dallas, Texas, US',
+  'gym in University Park, Dallas, Texas, US',
+  'gym in Preston Hollow, Dallas, Texas, US',
+  'gym in Turtle Creek, Dallas, Texas, US',
+  'gym in Southlake, Dallas, Texas, US',
+  'gym in Westlake, Fort Worth, Texas, US',
+  'gym in Starwood, Frisco, Texas, US',
+  'gym in Frisco, Dallas, Texas, US',
+  'gym in Plano, Dallas, Texas, US',
+  'gym in Coppell, Dallas, Texas, US',
+  'gym in River Oaks, Houston, Texas, US',
+  'gym in Bellaire, Houston, Texas, US',
+  'gym in West University Place, Houston, Texas, US',
+  'gym in Memorial Park, Houston, Texas, US',
+  'gym in The Woodlands, Houston, Texas, US',
+  'gym in Sugar Land, Houston, Texas, US',
+  'gym in Cinco Ranch, Houston, Texas, US',
+  'gym in Westlake Hills, Austin, Texas, US',
+  'gym in Barton Creek, Austin, Texas, US',
+  'gym in Horseshoe Bay, Texas, US',
+  'gym in Boerne, San Antonio, Texas, US',
+  'gym in Cordillera Ranch, Boerne, Texas, US'
 ];
 
-scrapeMultiple(queries, 30);
+scrapeMultiple(queries, 20);
